@@ -8,10 +8,8 @@ sys.path.insert(0, project_root)
 # Create compatibility layer for old module references
 import src.pico_gpt as pico_gpt
 import src.tokenizer as tokenizer
-import src.fast_tokenizer as fast_tokenizer
 sys.modules['pico_gpt'] = pico_gpt
 sys.modules['tokenizer'] = tokenizer
-sys.modules['fast_tokenizer'] = fast_tokenizer
 
 from src.pico_gpt import GPT
 import argparse

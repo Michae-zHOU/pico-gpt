@@ -17,7 +17,7 @@ import sys
 # Add parent directory to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from src.pico_gpt import GPT, GPTConfig
-from src.tokenizer import SimpleTokenizer
+from src.modern_tokenizer import ModernBPETokenizer
 
 
 def get_batch(data, batch_size, block_size, device):
@@ -62,30 +62,36 @@ def train_conversation_model():
     print("*** Training Conversational AI Model ***")
     print("=" * 45)
     
-    # Fixed hyperparameters for single response model
-    batch_size = 6        # Smaller batch for larger context
-    block_size = 256      # Larger context for complete responses
-    max_iters = 2000      # Adequate training
-    eval_interval = 100   # Regular evaluation
-    learning_rate = 2e-4  # Slightly lower for stability
-    warmup_iters = 200    # Proper warmup
-    lr_decay_iters = 1800
+    # Hyperparameters (12GB GPU friendly)
+    micro_batch_size = 2     # per-step micro-batch
+    grad_accum_steps = 16    # accumulate to reach effective batch size
+    batch_size = micro_batch_size  # keep API usage
+    block_size = 512         # context length
+    max_iters = 5000         # train longer
+    eval_interval = 200      # evaluation cadence
+    learning_rate = 2e-4     # base LR
+    warmup_iters = 1000      # warmup steps
+    lr_decay_iters = max_iters
     min_lr = 2e-5
-    eval_iters = 20
+    eval_iters = 50
     
     # Device configuration
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    # Optimized model for single complete responses
+    # Optimized model for conversation
     config = GPTConfig()
     config.block_size = block_size
-    config.vocab_size = 1500      # Good vocab size
-    config.n_layer = 8            # More layers for better single responses
-    config.n_head = 8             # Matching heads
-    config.n_embd = 512           # Larger embeddings for better quality
-    config.dropout = 0.1          # Good regularization
+    config.vocab_size = 8192      # train tokenizer to this size (updated below if loading)
+    config.n_layer = 12
+    config.n_head = 12
+    config.n_embd = 768
+    config.dropout = 0.1
     config.bias = True
+    # Modern features from upgraded model
+    config.use_sdpa = True
+    config.use_rope = True
+    config.mlp_type = 'swiglu'
     
     print(f"Conversation model configuration:")
     print(f"  - Layers: {config.n_layer}")
@@ -95,7 +101,7 @@ def train_conversation_model():
     print(f"  - Vocabulary size: {config.vocab_size}")
     
     # Load large conversational data
-    data_path = os.path.join('datasets', 'large_conversation.txt')
+    data_path = os.path.join('datasets', 'large_conversation_training.txt')
     if not os.path.exists(data_path):
         print(f"Large conversation dataset not found: {data_path}")
         return
@@ -107,8 +113,20 @@ def train_conversation_model():
     
     print(f"Data size: {len(text):,} characters")
     
-    # Create tokenizer optimized for conversation
-    tokenizer = SimpleTokenizer(vocab_size=config.vocab_size)
+    # Load/train Modern BPE tokenizer
+    tokenizer = ModernBPETokenizer(vocab_size=config.vocab_size)
+    tokenizer_path = os.path.join('models', 'modern_tokenizer.json')
+    if os.path.exists(tokenizer_path):
+        tokenizer.load(tokenizer_path)
+        print(f"Loaded tokenizer from: {tokenizer_path}")
+        # Update config vocab size to match loaded tokenizer
+        config.vocab_size = tokenizer.get_vocab_size()
+    else:
+        print(f"Training new tokenizer...")
+        tokenizer.train_from_file(data_path)
+        os.makedirs('models', exist_ok=True)
+        tokenizer.save(tokenizer_path)
+        config.vocab_size = tokenizer.get_vocab_size()
     
     # Encode the data
     data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
@@ -131,13 +149,27 @@ def train_conversation_model():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
     
-    # Optimizer optimized for conversation learning
+    # Optimizer with proper weight decay exclusions
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith('bias') or 'ln_' in name or 'LayerNorm' in name:
+            no_decay.append(param)
+        else:
+            decay.append(param)
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=learning_rate, 
-        weight_decay=0.01,    # Good regularization for conversations
-        betas=(0.9, 0.95)     # Good momentum for language modeling
+        [
+            {"params": decay, "weight_decay": 0.01},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=learning_rate,
+        betas=(0.9, 0.95),
     )
+
+    # AMP scaler
+    use_amp = (device == 'cuda')
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     
     print(f"\nStarting conversation training for {max_iters:,} iterations...")
     print("-" * 45)
@@ -188,20 +220,20 @@ def train_conversation_model():
                     print(f"  -> Early stopping after {patience} evaluations without improvement")
                     break
         
-        # Training step
-        xb, yb = get_batch(train_data, batch_size, block_size, device)
-        
-        # Forward pass
-        logits, loss = model(xb, yb)
-        
-        # Backward pass
+        # Training step with gradient accumulation and AMP
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        
-        # Gradient clipping for stability
+        accum_loss = 0.0
+        for micro_step in range(grad_accum_steps):
+            xb, yb = get_batch(train_data, micro_batch_size, block_size, device)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits, loss = model(xb, yb)
+            loss = loss / grad_accum_steps
+            scaler.scale(loss).backward()
+            accum_loss += loss.item()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
     
     total_time = time.time() - start_time
     print(f"\n*** Conversation training completed! ***")
@@ -230,10 +262,12 @@ def train_conversation_model():
         
         with torch.no_grad():
             generated = model.generate(
-                context, 
-                max_new_tokens=30,   # Even shorter for testing
-                temperature=0.7,     # Lower temperature for coherence
-                top_k=20            # More focused responses
+                context,
+                max_new_tokens=64,
+                temperature=0.8,
+                top_k=40,
+                top_p=0.9,
+                repetition_penalty=1.1,
             )
         
         generated_text = tokenizer.decode(generated[0].tolist())

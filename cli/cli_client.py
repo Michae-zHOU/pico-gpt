@@ -20,10 +20,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # Create compatibility layer for old module references in saved models
 import src.pico_gpt as pico_gpt
 import src.tokenizer as tokenizer
-import src.fast_tokenizer as fast_tokenizer
 sys.modules['pico_gpt'] = pico_gpt
 sys.modules['tokenizer'] = tokenizer
-sys.modules['fast_tokenizer'] = fast_tokenizer
 
 from src.pico_gpt import GPT, GPTConfig
 from src.tokenizer import SimpleTokenizer
