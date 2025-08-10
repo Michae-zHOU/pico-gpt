@@ -108,10 +108,26 @@ def train_conversation_model():
     
     print(f"\nLoading large conversation data from: {data_path}")
     
-    with open(data_path, 'r', encoding='utf-8') as f:
-        text = f.read()
+    # Load data in chunks to avoid memory issues
+    chunk_size = 1024 * 1024  # 1MB chunks
+    text_chunks = []
+    total_chars = 0
     
-    print(f"Data size: {len(text):,} characters")
+    with open(data_path, 'r', encoding='utf-8') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            text_chunks.append(chunk)
+            total_chars += len(chunk)
+            if len(text_chunks) % 100 == 0:  # Progress indicator
+                print(f"  Loaded {total_chars:,} characters...")
+    
+    print(f"Data size: {total_chars:,} characters")
+    
+    # Join chunks into full text
+    text = ''.join(text_chunks)
+    del text_chunks  # Free memory
     
     # Load/train Modern BPE tokenizer
     tokenizer = ModernBPETokenizer(vocab_size=config.vocab_size)

@@ -74,7 +74,7 @@ def add_openhermes(f, limit: int | None = None) -> int:
 
 def add_ultrachat(f, limit: int | None = None) -> int:
     """Add pairs from UltraChat-200k. Returns blocks written."""
-    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train")
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
     blocks = 0
     for row in ds:
         conversations = row.get("messages") or row.get("conversations") or []
